@@ -2,10 +2,11 @@ use arrow::io::ipc::read;
 use arrow::io::ipc::read::{Dictionaries, FileMetadata};
 use arrow::mmap::{mmap_dictionaries_unchecked, mmap_unchecked};
 use arrow::record_batch::RecordBatch;
+use memmap::Mmap;
 use polars_core::prelude::*;
 
 use super::ipc_file::IpcReader;
-use crate::mmap::{MMapSemaphore, MmapBytesReader};
+use crate::mmap::MmapBytesReader;
 use crate::predicates::PhysicalIoExpr;
 use crate::shared::{finish_reader, ArrowReader};
 use crate::utils::{apply_projection, columns_to_projection};
@@ -15,19 +16,10 @@ impl<R: MmapBytesReader> IpcReader<R> {
         &mut self,
         predicate: Option<Arc<dyn PhysicalIoExpr>>,
     ) -> PolarsResult<DataFrame> {
-        #[cfg(target_family = "unix")]
-        use std::os::unix::fs::MetadataExt;
         match self.reader.to_file() {
             Some(file) => {
-                #[cfg(target_family = "unix")]
-                let metadata = file.metadata()?;
                 let mmap = unsafe { memmap::Mmap::map(file).unwrap() };
-                #[cfg(target_family = "unix")]
-                let semaphore = MMapSemaphore::new(metadata.dev(), metadata.ino(), mmap);
-                #[cfg(not(target_family = "unix"))]
-                let semaphore = MMapSemaphore::new(mmap);
-                let metadata =
-                    read::read_file_metadata(&mut std::io::Cursor::new(semaphore.as_ref()))?;
+                let metadata = read::read_file_metadata(&mut std::io::Cursor::new(&mmap))?;
 
                 if let Some(columns) = &self.columns {
                     let schema = &metadata.schema;
@@ -41,7 +33,7 @@ impl<R: MmapBytesReader> IpcReader<R> {
                     metadata.schema.clone()
                 };
 
-                let reader = MMapChunkIter::new(Arc::new(semaphore), metadata, &self.projection)?;
+                let reader = MMapChunkIter::new(Arc::new(mmap), metadata, &self.projection)?;
 
                 finish_reader(
                     reader,
@@ -61,7 +53,7 @@ impl<R: MmapBytesReader> IpcReader<R> {
 struct MMapChunkIter<'a> {
     dictionaries: Dictionaries,
     metadata: FileMetadata,
-    mmap: Arc<MMapSemaphore>,
+    mmap: Arc<Mmap>,
     idx: usize,
     end: usize,
     projection: &'a Option<Vec<usize>>,
@@ -69,7 +61,7 @@ struct MMapChunkIter<'a> {
 
 impl<'a> MMapChunkIter<'a> {
     fn new(
-        mmap: Arc<MMapSemaphore>,
+        mmap: Arc<Mmap>,
         metadata: FileMetadata,
         projection: &'a Option<Vec<usize>>,
     ) -> PolarsResult<Self> {

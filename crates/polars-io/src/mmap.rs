@@ -1,76 +1,7 @@
-use std::collections::btree_map::Entry;
-use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufReader, Cursor, Read, Seek};
-use std::sync::Mutex;
 
-use memmap::Mmap;
-use once_cell::sync::Lazy;
 use polars_core::config::verbose;
-use polars_error::{polars_bail, PolarsResult};
-
-// Keep track of memory mapped files so we don't write to them while reading
-// Use a btree as it uses less memory than a hashmap and this thing never shrinks.
-// Write handle in Windows is exclusive, so this is only necessary in Unix.
-#[cfg(target_family = "unix")]
-static MEMORY_MAPPED_FILES: Lazy<Mutex<BTreeMap<(u64, u64), u32>>> =
-    Lazy::new(|| Mutex::new(Default::default()));
-
-pub(crate) struct MMapSemaphore {
-    #[cfg(target_family = "unix")]
-    key: (u64, u64),
-    mmap: Mmap,
-}
-
-impl MMapSemaphore {
-    #[cfg(target_family = "unix")]
-    pub(super) fn new(dev: u64, ino: u64, mmap: Mmap) -> Self {
-        let mut guard = MEMORY_MAPPED_FILES.lock().unwrap();
-        let key = (dev, ino);
-        guard.insert(key, 1);
-        Self { key, mmap }
-    }
-
-    #[cfg(not(target_family = "unix"))]
-    pub(super) fn new(mmap: Mmap) -> Self {
-        Self { mmap }
-    }
-}
-
-impl AsRef<[u8]> for MMapSemaphore {
-    #[inline]
-    fn as_ref(&self) -> &[u8] {
-        self.mmap.as_ref()
-    }
-}
-
-#[cfg(target_family = "unix")]
-impl Drop for MMapSemaphore {
-    fn drop(&mut self) {
-        let mut guard = MEMORY_MAPPED_FILES.lock().unwrap();
-        if let Entry::Occupied(mut e) = guard.entry(self.key) {
-            let v = e.get_mut();
-            *v -= 1;
-
-            if *v == 0 {
-                e.remove_entry();
-            }
-        }
-    }
-}
-
-pub fn ensure_not_mapped(file: &File) -> PolarsResult<()> {
-    #[cfg(target_family = "unix")]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let guard = MEMORY_MAPPED_FILES.lock().unwrap();
-        let metadata = file.metadata()?;
-        if guard.contains_key(&(metadata.dev(), metadata.ino())) {
-            polars_bail!(ComputeError: "cannot write to file: already memory mapped");
-        }
-    }
-    Ok(())
-}
 
 /// Trait used to get a hold to file handler or to the underlying bytes
 /// without performing a Read.
