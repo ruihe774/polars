@@ -33,4 +33,5 @@ pub use cloud::glob as async_glob;
 pub use options::*;
 pub use shared::*;
 
+pub mod file_lock;
 pub mod hive;
