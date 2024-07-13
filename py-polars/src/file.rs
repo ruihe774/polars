@@ -8,8 +8,9 @@ use std::os::fd::{FromRawFd, RawFd};
 use std::path::PathBuf;
 
 use either::{for_both, Either};
+use polars::io::file_lock;
 use polars::io::mmap::MmapBytesReader;
-use polars_error::{polars_err, polars_warn};
+use polars_error::{polars_err, polars_warn, PolarsResult};
 use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString};
@@ -227,10 +228,7 @@ impl MmapBytesReader for FileWrapper {
 }
 
 impl FileWrapper {
-    pub fn new_with_path(
-        py_f: Bound<PyAny>,
-        write: bool,
-    ) -> PyResult<(FileWrapper, Option<PathBuf>)> {
+    fn new_unlocked(py_f: Bound<PyAny>, write: bool) -> PyResult<(FileWrapper, Option<PathBuf>)> {
         let py = py_f.py();
         if let Ok(s) = py_f.extract::<Cow<str>>() {
             let file_path = std::path::Path::new(&*s);
@@ -335,8 +333,30 @@ impl FileWrapper {
         }
     }
 
+    pub fn new_with_path(
+        py_f: Bound<PyAny>,
+        write: bool,
+    ) -> PyResult<(FileWrapper, Option<PathBuf>)> {
+        let (mut f, path) = FileWrapper::new_unlocked(py_f, write)?;
+        f.lock(write).map_err(PyPolarsErr::from)?;
+        Ok((f, path))
+    }
+
     pub fn new(py_f: Bound<PyAny>, write: bool) -> PyResult<FileWrapper> {
         FileWrapper::new_with_path(py_f, write).map(|(f, _)| f)
+    }
+
+    fn lock(&mut self, write: bool) -> PolarsResult<()> {
+        if let Either::Left(ref mut f) = self.0 {
+            file_lock::lock(f, write)?;
+        }
+        Ok(())
+    }
+
+    fn unlock(&mut self) {
+        if let Either::Left(ref mut f) = self.0 {
+            file_lock::unlock(f);
+        }
     }
 
     pub fn is_buffered(&self) -> bool {
@@ -349,6 +369,12 @@ impl FileWrapper {
                     .unwrap_or_default()
             }),
         }
+    }
+}
+
+impl Drop for FileWrapper {
+    fn drop(&mut self) {
+        self.unlock()
     }
 }
 

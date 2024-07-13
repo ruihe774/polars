@@ -10,7 +10,7 @@ import pandas as pd
 import pytest
 
 import polars as pl
-from polars.exceptions import ComputeError
+from polars.exceptions import InvalidOperationError
 from polars.interchange.protocol import CompatLevel
 from polars.testing import assert_frame_equal
 
@@ -361,7 +361,5 @@ def test_ipc_raise_on_writing_mmap(tmp_path: Path) -> None:
         ):
             df.write_ipc(p)
     else:
-        with pytest.raises(
-            ComputeError, match="cannot write to file: already memory mapped"
-        ):
+        with pytest.raises(InvalidOperationError, match="file already locked"):
             df.write_ipc(p)
