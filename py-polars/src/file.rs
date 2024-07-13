@@ -1,11 +1,13 @@
 use std::borrow::Cow;
 use std::fs::{self, File};
-use std::io;
-use std::io::{Cursor, ErrorKind, Read, Seek, SeekFrom, Write};
+use std::io::{
+    self, BorrowedCursor, Cursor, ErrorKind, IoSlice, IoSliceMut, Read, Seek, SeekFrom, Write,
+};
 #[cfg(target_family = "unix")]
 use std::os::fd::{FromRawFd, RawFd};
 use std::path::PathBuf;
 
+use either::{for_both, Either};
 use polars::io::mmap::MmapBytesReader;
 use polars_error::{polars_err, polars_warn};
 use pyo3::exceptions::PyTypeError;
@@ -15,7 +17,6 @@ use pyo3::types::{PyBytes, PyString};
 use crate::error::PyPolarsErr;
 use crate::prelude::resolve_homedir;
 
-#[derive(Clone)]
 pub struct PyFileLikeObject {
     inner: PyObject,
 }
@@ -27,28 +28,6 @@ impl PyFileLikeObject {
     /// instantiate it with `PyFileLikeObject::require`
     pub fn new(object: PyObject) -> Self {
         PyFileLikeObject { inner: object }
-    }
-
-    pub fn as_buffer(&self) -> std::io::Cursor<Vec<u8>> {
-        let data = self.as_file_buffer().into_inner();
-        std::io::Cursor::new(data)
-    }
-
-    pub fn as_file_buffer(&self) -> Cursor<Vec<u8>> {
-        let buf = Python::with_gil(|py| {
-            let bytes = self
-                .inner
-                .call_method_bound(py, "read", (), None)
-                .expect("no read method found");
-
-            let bytes: &Bound<'_, PyBytes> = bytes
-                .downcast_bound(py)
-                .expect("Expecting to be able to downcast into bytes from read result.");
-
-            bytes.as_bytes().to_vec()
-        });
-
-        Cursor::new(buf)
     }
 
     /// Validates that the underlying
@@ -169,32 +148,90 @@ impl Seek for PyFileLikeObject {
     }
 }
 
-pub trait FileLike: Read + Write + Seek + Sync + Send {}
+pub struct FileWrapper(Either<File, PyFileLikeObject>);
 
-impl FileLike for File {}
-impl FileLike for PyFileLikeObject {}
-impl MmapBytesReader for PyFileLikeObject {}
+impl Read for FileWrapper {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        for_both!(&mut self.0, f => f.read(buf))
+    }
 
-pub enum EitherRustPythonFile {
-    Py(PyFileLikeObject),
-    Rust(File),
+    fn read_vectored(&mut self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
+        for_both!(&mut self.0, f => f.read_vectored(bufs))
+    }
+
+    fn is_read_vectored(&self) -> bool {
+        for_both!(&self.0, f => f.is_read_vectored())
+    }
+
+    fn read_to_end(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
+        for_both!(&mut self.0, f => f.read_to_end(buf))
+    }
+
+    fn read_to_string(&mut self, buf: &mut String) -> io::Result<usize> {
+        for_both!(&mut self.0, f => f.read_to_string(buf))
+    }
+
+    fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
+        for_both!(&mut self.0, f => f.read_exact(buf))
+    }
+
+    fn read_buf(&mut self, buf: BorrowedCursor<'_>) -> io::Result<()> {
+        for_both!(&mut self.0, f => f.read_buf(buf))
+    }
+
+    fn read_buf_exact(&mut self, cursor: BorrowedCursor<'_>) -> io::Result<()> {
+        for_both!(&mut self.0, f => f.read_buf_exact(cursor))
+    }
 }
 
-impl EitherRustPythonFile {
-    pub fn into_dyn(self) -> Box<dyn FileLike> {
-        match self {
-            EitherRustPythonFile::Py(f) => Box::new(f),
-            EitherRustPythonFile::Rust(f) => Box::new(f),
+impl Write for FileWrapper {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        for_both!(&mut self.0, f => f.write(buf))
+    }
+
+    fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+        for_both!(&mut self.0, f => f.write_vectored(bufs))
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        for_both!(&self.0, f => f.is_write_vectored())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        for_both!(&mut self.0, f => f.flush())
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        for_both!(&mut self.0, f => f.write_all(buf))
+    }
+
+    fn write_all_vectored(&mut self, bufs: &mut [IoSlice<'_>]) -> io::Result<()> {
+        for_both!(&mut self.0, f => f.write_all_vectored(bufs))
+    }
+}
+
+impl Seek for FileWrapper {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        for_both!(&mut self.0, f => f.seek(pos))
+    }
+}
+
+impl MmapBytesReader for FileWrapper {
+    fn to_file(&self) -> Option<&File> {
+        if let Either::Left(ref f) = self.0 {
+            Some(f)
+        } else {
+            None
         }
     }
 }
 
-fn get_either_file_and_path(
-    py_f: PyObject,
-    write: bool,
-) -> PyResult<(EitherRustPythonFile, Option<PathBuf>)> {
-    Python::with_gil(|py| {
-        let py_f = py_f.into_bound(py);
+impl FileWrapper {
+    pub fn new_with_path(
+        py_f: Bound<PyAny>,
+        write: bool,
+    ) -> PyResult<(FileWrapper, Option<PathBuf>)> {
+        let py = py_f.py();
         if let Ok(s) = py_f.extract::<Cow<str>>() {
             let file_path = std::path::Path::new(&*s);
             let file_path = resolve_homedir(file_path);
@@ -203,7 +240,7 @@ fn get_either_file_and_path(
             } else {
                 polars_utils::open_file(&file_path).map_err(PyPolarsErr::from)?
             };
-            Ok((EitherRustPythonFile::Rust(f), Some(file_path)))
+            Ok((FileWrapper(Either::Left(f)), Some(file_path)))
         } else {
             let io = py.import_bound("io").unwrap();
             let is_utf8_encoding = |py_f: &Bound<PyAny>| -> PyResult<bool> {
@@ -256,7 +293,7 @@ fn get_either_file_and_path(
             .map(|fileno| fileno as RawFd)
             {
                 return Ok((
-                    EitherRustPythonFile::Rust(unsafe { File::from_raw_fd(fd) }),
+                    FileWrapper(Either::Left(unsafe { File::from_raw_fd(fd) })),
                     // This works on Linux and BSD with procfs mounted,
                     // otherwise it fails silently.
                     fs::canonicalize(format!("/proc/self/fd/{fd}")).ok(),
@@ -294,21 +331,29 @@ fn get_either_file_and_path(
             };
             PyFileLikeObject::ensure_requirements(&py_f, !write, write, !write)?;
             let f = PyFileLikeObject::new(py_f.to_object(py));
-            Ok((EitherRustPythonFile::Py(f), None))
+            Ok((FileWrapper(Either::Right(f)), None))
         }
-    })
+    }
+
+    pub fn new(py_f: Bound<PyAny>, write: bool) -> PyResult<FileWrapper> {
+        FileWrapper::new_with_path(py_f, write).map(|(f, _)| f)
+    }
+
+    pub fn is_buffered(&self) -> bool {
+        match self.0 {
+            Either::Left(_) => false,
+            Either::Right(ref py_f) => Python::with_gil(|py| {
+                let py_f = py_f.inner.bind(py);
+                let io = py.import_bound("io").unwrap();
+                py_f.is_instance(&io.getattr("BufferedIOBase").unwrap())
+                    .unwrap_or_default()
+            }),
+        }
+    }
 }
 
-///
-/// # Arguments
-/// * `write` - open for writing; will truncate existing file and create new file if not.
-pub fn get_either_file(py_f: PyObject, write: bool) -> PyResult<EitherRustPythonFile> {
-    Ok(get_either_file_and_path(py_f, write)?.0)
-}
-
-pub fn get_file_like(f: PyObject, truncate: bool) -> PyResult<Box<dyn FileLike>> {
-    Ok(get_either_file(f, truncate)?.into_dyn())
-}
+// XXX: I want to remove the following functions in the future.
+// So that we can have a single entrypoint.
 
 /// If the give file-like is a BytesIO, read its contents.
 pub fn read_if_bytesio(py_f: Bound<PyAny>) -> Bound<PyAny> {
@@ -337,12 +382,9 @@ pub fn get_mmap_bytes_reader_and_path<'a>(
     // bytes object
     if let Ok(bytes) = py_f.downcast::<PyBytes>() {
         Ok((Box::new(Cursor::new(bytes.as_bytes())), None))
-    }
-    // string so read file
-    else {
-        match get_either_file_and_path(py_f.to_object(py_f.py()), false)? {
-            (EitherRustPythonFile::Rust(f), path) => Ok((Box::new(f), path)),
-            (EitherRustPythonFile::Py(f), path) => Ok((Box::new(f), path)),
-        }
+    } else {
+        FileWrapper::new_with_path(py_f.clone(), false).map(
+            |(f, path)| -> (Box<dyn MmapBytesReader + 'a>, Option<PathBuf>) { (Box::new(f), path) },
+        )
     }
 }

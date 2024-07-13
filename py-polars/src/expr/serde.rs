@@ -1,4 +1,4 @@
-use std::io::{BufReader, BufWriter, Cursor};
+use std::io::{BufReader, BufWriter, Cursor, Read};
 
 use polars::lazy::prelude::Expr;
 use pyo3::prelude::*;
@@ -7,7 +7,7 @@ use pyo3::types::PyBytes;
 
 use crate::error::PyPolarsErr;
 use crate::exceptions::ComputeError;
-use crate::file::get_file_like;
+use crate::file::FileWrapper;
 use crate::PyExpr;
 
 #[pymethods]
@@ -35,8 +35,8 @@ impl PyExpr {
     }
 
     /// Serialize into binary data.
-    fn serialize_binary(&self, py_f: PyObject) -> PyResult<()> {
-        let file = get_file_like(py_f, true)?;
+    fn serialize_binary(&self, py_f: Bound<PyAny>) -> PyResult<()> {
+        let file = FileWrapper::new(py_f, true)?;
         let writer = BufWriter::new(file);
         ciborium::into_writer(&self.inner, writer)
             .map_err(|err| ComputeError::new_err(err.to_string()))
@@ -44,8 +44,8 @@ impl PyExpr {
 
     /// Serialize into a JSON string.
     #[cfg(feature = "json")]
-    fn serialize_json(&self, py_f: PyObject) -> PyResult<()> {
-        let file = get_file_like(py_f, true)?;
+    fn serialize_json(&self, py_f: Bound<PyAny>) -> PyResult<()> {
+        let file = FileWrapper::new(py_f, true)?;
         let writer = BufWriter::new(file);
         serde_json::to_writer(writer, &self.inner)
             .map_err(|err| ComputeError::new_err(err.to_string()))
@@ -53,8 +53,8 @@ impl PyExpr {
 
     /// Deserialize a file-like object containing binary data into an Expr.
     #[staticmethod]
-    fn deserialize_binary(py_f: PyObject) -> PyResult<PyExpr> {
-        let file = get_file_like(py_f, false)?;
+    fn deserialize_binary(py_f: Bound<PyAny>) -> PyResult<PyExpr> {
+        let file = FileWrapper::new(py_f, false)?;
         let reader = BufReader::new(file);
         let expr = ciborium::from_reader::<Expr, _>(reader)
             .map_err(|err| ComputeError::new_err(err.to_string()))?;
@@ -64,11 +64,11 @@ impl PyExpr {
     /// Deserialize a file-like object containing JSON string data into an Expr.
     #[staticmethod]
     #[cfg(feature = "json")]
-    fn deserialize_json(py_f: PyObject) -> PyResult<PyExpr> {
+    fn deserialize_json(py_f: Bound<PyAny>) -> PyResult<PyExpr> {
         // it is faster to first read to memory and then parse: https://github.com/serde-rs/json/issues/160
         // so don't bother with files.
         let mut json = String::new();
-        let _ = get_file_like(py_f, false)?
+        let _ = FileWrapper::new(py_f, false)?
             .read_to_string(&mut json)
             .unwrap();
 

@@ -8,7 +8,7 @@ use pyo3::types::PyBytes;
 use super::PyDataFrame;
 use crate::error::PyPolarsErr;
 use crate::exceptions::ComputeError;
-use crate::file::{get_file_like, get_mmap_bytes_reader};
+use crate::file::{get_mmap_bytes_reader, FileWrapper};
 use crate::prelude::*;
 
 #[pymethods]
@@ -44,8 +44,8 @@ impl PyDataFrame {
     }
 
     /// Serialize into binary data.
-    fn serialize_binary(&self, py_f: PyObject) -> PyResult<()> {
-        let file = get_file_like(py_f, true)?;
+    fn serialize_binary(&self, py_f: Bound<PyAny>) -> PyResult<()> {
+        let file = FileWrapper::new(py_f, true)?;
         let writer = BufWriter::new(file);
         ciborium::into_writer(&self.df, writer)
             .map_err(|err| ComputeError::new_err(err.to_string()))
@@ -53,8 +53,8 @@ impl PyDataFrame {
 
     /// Serialize into a JSON string.
     #[cfg(feature = "json")]
-    pub fn serialize_json(&mut self, py_f: PyObject) -> PyResult<()> {
-        let file = get_file_like(py_f, true)?;
+    pub fn serialize_json(&mut self, py_f: Bound<PyAny>) -> PyResult<()> {
+        let file = FileWrapper::new(py_f, true)?;
         let writer = BufWriter::new(file);
         serde_json::to_writer(writer, &self.df)
             .map_err(|err| ComputeError::new_err(err.to_string()))
@@ -62,8 +62,8 @@ impl PyDataFrame {
 
     /// Deserialize a file-like object containing binary data into a DataFrame.
     #[staticmethod]
-    fn deserialize_binary(py_f: PyObject) -> PyResult<Self> {
-        let file = get_file_like(py_f, false)?;
+    fn deserialize_binary(py_f: Bound<PyAny>) -> PyResult<Self> {
+        let file = FileWrapper::new(py_f, false)?;
         let reader = BufReader::new(file);
         let df = ciborium::from_reader::<DataFrame, _>(reader)
             .map_err(|err| ComputeError::new_err(err.to_string()))?;

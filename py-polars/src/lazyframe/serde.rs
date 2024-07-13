@@ -1,4 +1,4 @@
-use std::io::{BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, Read};
 
 use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedBytes;
@@ -7,7 +7,7 @@ use pyo3::types::PyBytes;
 use super::PyLazyFrame;
 use crate::error::PyPolarsErr;
 use crate::exceptions::ComputeError;
-use crate::file::get_file_like;
+use crate::file::FileWrapper;
 use crate::prelude::*;
 
 #[pymethods]
@@ -36,8 +36,8 @@ impl PyLazyFrame {
     }
 
     /// Serialize into binary data.
-    fn serialize_binary(&self, py_f: PyObject) -> PyResult<()> {
-        let file = get_file_like(py_f, true)?;
+    fn serialize_binary(&self, py_f: Bound<PyAny>) -> PyResult<()> {
+        let file = FileWrapper::new(py_f, true)?;
         let writer = BufWriter::new(file);
         ciborium::into_writer(&self.ldf.logical_plan, writer)
             .map_err(|err| ComputeError::new_err(err.to_string()))
@@ -45,8 +45,8 @@ impl PyLazyFrame {
 
     /// Serialize into a JSON string.
     #[cfg(feature = "json")]
-    fn serialize_json(&self, py_f: PyObject) -> PyResult<()> {
-        let file = get_file_like(py_f, true)?;
+    fn serialize_json(&self, py_f: Bound<PyAny>) -> PyResult<()> {
+        let file = FileWrapper::new(py_f, true)?;
         let writer = BufWriter::new(file);
         serde_json::to_writer(writer, &self.ldf.logical_plan)
             .map_err(|err| ComputeError::new_err(err.to_string()))
@@ -54,8 +54,8 @@ impl PyLazyFrame {
 
     /// Deserialize a file-like object containing binary data into a LazyFrame.
     #[staticmethod]
-    fn deserialize_binary(py_f: PyObject) -> PyResult<Self> {
-        let file = get_file_like(py_f, false)?;
+    fn deserialize_binary(py_f: Bound<PyAny>) -> PyResult<Self> {
+        let file = FileWrapper::new(py_f, false)?;
         let reader = BufReader::new(file);
         let lp = ciborium::from_reader::<DslPlan, _>(reader)
             .map_err(|err| ComputeError::new_err(err.to_string()))?;
@@ -65,11 +65,11 @@ impl PyLazyFrame {
     /// Deserialize a file-like object containing JSON string data into a LazyFrame.
     #[staticmethod]
     #[cfg(feature = "json")]
-    fn deserialize_json(py_f: PyObject) -> PyResult<Self> {
+    fn deserialize_json(py_f: Bound<PyAny>) -> PyResult<Self> {
         // it is faster to first read to memory and then parse: https://github.com/serde-rs/json/issues/160
         // so don't bother with files.
         let mut json = String::new();
-        let _ = get_file_like(py_f, false)?
+        let _ = FileWrapper::new(py_f, false)?
             .read_to_string(&mut json)
             .unwrap();
 

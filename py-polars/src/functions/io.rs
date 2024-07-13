@@ -9,19 +9,20 @@ use pyo3::types::PyDict;
 
 use crate::conversion::Wrap;
 use crate::error::PyPolarsErr;
-use crate::file::{get_either_file, EitherRustPythonFile};
+use crate::file::FileWrapper;
 use crate::prelude::ArrowDataType;
 
 #[cfg(feature = "ipc")]
 #[pyfunction]
-pub fn read_ipc_schema(py: Python, py_f: PyObject) -> PyResult<PyObject> {
+pub fn read_ipc_schema(py: Python, py_f: Bound<PyAny>) -> PyResult<PyObject> {
     use polars_core::export::arrow::io::ipc::read::read_file_metadata;
-    let metadata = match get_either_file(py_f, false)? {
-        EitherRustPythonFile::Rust(r) => {
-            read_file_metadata(&mut BufReader::new(r)).map_err(PyPolarsErr::from)?
-        },
-        EitherRustPythonFile::Py(mut r) => read_file_metadata(&mut r).map_err(PyPolarsErr::from)?,
-    };
+    let mut r = FileWrapper::new(py_f, false)?;
+    let metadata = if r.is_buffered() {
+        read_file_metadata(&mut r)
+    } else {
+        read_file_metadata(&mut BufReader::new(r))
+    }
+    .map_err(PyPolarsErr::from)?;
 
     let dict = PyDict::new_bound(py);
     fields_to_pydict(&metadata.schema.fields, &dict, py)?;
@@ -30,15 +31,15 @@ pub fn read_ipc_schema(py: Python, py_f: PyObject) -> PyResult<PyObject> {
 
 #[cfg(feature = "parquet")]
 #[pyfunction]
-pub fn read_parquet_schema(py: Python, py_f: PyObject) -> PyResult<PyObject> {
+pub fn read_parquet_schema(py: Python, py_f: Bound<PyAny>) -> PyResult<PyObject> {
     use polars_parquet::read::{infer_schema, read_metadata};
-
-    let metadata = match get_either_file(py_f, false)? {
-        EitherRustPythonFile::Rust(r) => {
-            read_metadata(&mut BufReader::new(r)).map_err(PyPolarsErr::from)?
-        },
-        EitherRustPythonFile::Py(mut r) => read_metadata(&mut r).map_err(PyPolarsErr::from)?,
-    };
+    let mut r = FileWrapper::new(py_f, false)?;
+    let metadata = if r.is_buffered() {
+        read_metadata(&mut r)
+    } else {
+        read_metadata(&mut BufReader::new(r))
+    }
+    .map_err(PyPolarsErr::from)?;
     let arrow_schema = infer_schema(&metadata).map_err(PyPolarsErr::from)?;
 
     let dict = PyDict::new_bound(py);

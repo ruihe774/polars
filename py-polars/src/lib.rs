@@ -1,4 +1,8 @@
+#![feature(can_vector)]
+#![feature(core_io_borrowed_buf)]
+#![feature(read_buf)]
 #![feature(vec_into_raw_parts)]
+#![feature(write_all_vectored)]
 #![allow(clippy::nonstandard_macro_braces)] // Needed because clippy does not understand proc macro of PyO3
 #![allow(clippy::transmute_undefined_repr)]
 #![allow(non_local_definitions)]

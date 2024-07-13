@@ -1,10 +1,10 @@
-use std::io::BufWriter;
+use std::io::{BufWriter, Read};
 use std::num::NonZeroUsize;
 
 #[cfg(feature = "avro")]
 use polars::io::avro::AvroCompression;
-use polars::io::mmap::ensure_not_mapped;
 use polars::io::RowIndex;
+use polars_io::mmap::MmapBytesReader;
 #[cfg(feature = "parquet")]
 use polars_parquet::arrow::write::StatisticsOptions;
 use pyo3::prelude::*;
@@ -15,8 +15,7 @@ use super::*;
 use crate::conversion::parse_parquet_compression;
 use crate::conversion::Wrap;
 use crate::file::{
-    get_either_file, get_file_like, get_mmap_bytes_reader, get_mmap_bytes_reader_and_path,
-    read_if_bytesio, EitherRustPythonFile,
+    get_mmap_bytes_reader, get_mmap_bytes_reader_and_path, read_if_bytesio, FileWrapper,
 };
 use crate::prelude::PyCompatLevel;
 
@@ -137,7 +136,7 @@ impl PyDataFrame {
     #[pyo3(signature = (py_f, columns, projection, n_rows, row_index, low_memory, parallel, use_statistics, rechunk))]
     pub fn read_parquet(
         py: Python,
-        py_f: PyObject,
+        py_f: Bound<PyAny>,
         columns: Option<Vec<String>>,
         projection: Option<Vec<usize>>,
         n_rows: Option<usize>,
@@ -147,29 +146,36 @@ impl PyDataFrame {
         use_statistics: bool,
         rechunk: bool,
     ) -> PyResult<Self> {
-        use EitherRustPythonFile::*;
-
         let row_index = row_index.map(|(name, offset)| RowIndex {
             name: Arc::from(name.as_str()),
             offset,
         });
-        let result = match get_either_file(py_f, false)? {
-            Py(f) => {
-                let buf = f.as_buffer();
-                py.allow_threads(move || {
-                    ParquetReader::new(buf)
-                        .with_projection(projection)
-                        .with_columns(columns)
-                        .read_parallel(parallel.0)
-                        .with_n_rows(n_rows)
-                        .with_row_index(row_index)
-                        .set_low_memory(low_memory)
-                        .use_statistics(use_statistics)
-                        .set_rechunk(rechunk)
-                        .finish()
-                })
+        let mut f = FileWrapper::new(py_f, false)?;
+        let result = match f.to_file() {
+            None => {
+                // XXX: IDK why we need this.
+                // It fails the test if removed.
+                let mut buf = Vec::new();
+                match f.read_to_end(&mut buf) {
+                    Ok(_) => {
+                        let buf = std::io::Cursor::new(buf);
+                        py.allow_threads(move || {
+                            ParquetReader::new(buf)
+                                .with_projection(projection)
+                                .with_columns(columns)
+                                .read_parallel(parallel.0)
+                                .with_n_rows(n_rows)
+                                .with_row_index(row_index)
+                                .set_low_memory(low_memory)
+                                .use_statistics(use_statistics)
+                                .set_rechunk(rechunk)
+                                .finish()
+                        })
+                    },
+                    Err(e) => Err(PolarsError::from(e)),
+                }
             },
-            Rust(f) => py.allow_threads(move || {
+            Some(_) => py.allow_threads(move || {
                 ParquetReader::new(f)
                     .with_projection(projection)
                     .with_columns(columns)
@@ -195,7 +201,6 @@ impl PyDataFrame {
         schema_overrides: Option<Wrap<Schema>>,
     ) -> PyResult<Self> {
         assert!(infer_schema_length != Some(0));
-        use crate::file::read_if_bytesio;
         py_f = read_if_bytesio(py_f);
         let mmap_bytes_r = get_mmap_bytes_reader(&py_f)?;
 
@@ -316,14 +321,14 @@ impl PyDataFrame {
     #[pyo3(signature = (py_f, columns, projection, n_rows))]
     pub fn read_avro(
         py: Python,
-        py_f: PyObject,
+        py_f: Bound<PyAny>,
         columns: Option<Vec<String>>,
         projection: Option<Vec<usize>>,
         n_rows: Option<usize>,
     ) -> PyResult<Self> {
         use polars::io::avro::AvroReader;
 
-        let file = get_file_like(py_f, false)?;
+        let file = FileWrapper::new(py_f, false)?;
         let df = py.allow_threads(move || {
             AvroReader::new(file)
                 .with_projection(projection)
@@ -339,7 +344,7 @@ impl PyDataFrame {
     pub fn write_csv(
         &mut self,
         py: Python,
-        py_f: PyObject,
+        py_f: Bound<PyAny>,
         include_bom: bool,
         include_header: bool,
         separator: u8,
@@ -355,7 +360,7 @@ impl PyDataFrame {
         quote_style: Option<Wrap<QuoteStyle>>,
     ) -> PyResult<()> {
         let null = null_value.unwrap_or_default();
-        let mut buf = get_file_like(py_f, true)?;
+        let mut buf = FileWrapper::new(py_f, true)?;
         py.allow_threads(|| {
             CsvWriter::new(&mut buf)
                 .include_bom(include_bom)
@@ -382,7 +387,7 @@ impl PyDataFrame {
     pub fn write_parquet(
         &mut self,
         py: Python,
-        py_f: PyObject,
+        py_f: Bound<PyAny>,
         compression: &str,
         compression_level: Option<i32>,
         statistics: Wrap<StatisticsOptions>,
@@ -390,7 +395,7 @@ impl PyDataFrame {
         data_page_size: Option<usize>,
     ) -> PyResult<()> {
         let compression = parse_parquet_compression(compression, compression_level)?;
-        let buf = get_file_like(py_f, true)?;
+        let buf = FileWrapper::new(py_f, true)?;
         py.allow_threads(|| {
             ParquetWriter::new(buf)
                 .with_compression(compression)
@@ -447,8 +452,8 @@ impl PyDataFrame {
     }
 
     #[cfg(feature = "json")]
-    pub fn write_json(&mut self, py_f: PyObject) -> PyResult<()> {
-        let file = BufWriter::new(get_file_like(py_f, true)?);
+    pub fn write_json(&mut self, py_f: Bound<PyAny>) -> PyResult<()> {
+        let file = BufWriter::new(FileWrapper::new(py_f, true)?);
 
         JsonWriter::new(file)
             .with_json_format(JsonFormat::Json)
@@ -458,8 +463,8 @@ impl PyDataFrame {
     }
 
     #[cfg(feature = "json")]
-    pub fn write_ndjson(&mut self, py_f: PyObject) -> PyResult<()> {
-        let file = BufWriter::new(get_file_like(py_f, true)?);
+    pub fn write_ndjson(&mut self, py_f: Bound<PyAny>) -> PyResult<()> {
+        let file = BufWriter::new(FileWrapper::new(py_f, true)?);
 
         JsonWriter::new(file)
             .with_json_format(JsonFormat::JsonLines)
@@ -473,17 +478,13 @@ impl PyDataFrame {
     pub fn write_ipc(
         &mut self,
         py: Python,
-        py_f: PyObject,
+        py_f: Bound<PyAny>,
         compression: Wrap<Option<IpcCompression>>,
         compat_level: PyCompatLevel,
     ) -> PyResult<()> {
-        let either = get_either_file(py_f, true)?;
-        if let EitherRustPythonFile::Rust(ref f) = either {
-            ensure_not_mapped(f).map_err(PyPolarsErr::from)?;
-        }
-        let mut buf = either.into_dyn();
+        let buf = FileWrapper::new(py_f, true)?;
         py.allow_threads(|| {
-            IpcWriter::new(&mut buf)
+            IpcWriter::new(buf)
                 .with_compression(compression.0)
                 .with_compat_level(compat_level.0)
                 .finish(&mut self.df)
@@ -496,13 +497,13 @@ impl PyDataFrame {
     pub fn write_ipc_stream(
         &mut self,
         py: Python,
-        py_f: PyObject,
+        py_f: Bound<PyAny>,
         compression: Wrap<Option<IpcCompression>>,
         compat_level: PyCompatLevel,
     ) -> PyResult<()> {
-        let mut buf = get_file_like(py_f, true)?;
+        let buf = FileWrapper::new(py_f, true)?;
         py.allow_threads(|| {
-            IpcStreamWriter::new(&mut buf)
+            IpcStreamWriter::new(buf)
                 .with_compression(compression.0)
                 .with_compat_level(compat_level.0)
                 .finish(&mut self.df)
@@ -516,14 +517,14 @@ impl PyDataFrame {
     pub fn write_avro(
         &mut self,
         py: Python,
-        py_f: PyObject,
+        py_f: Bound<PyAny>,
         compression: Wrap<Option<AvroCompression>>,
         name: String,
     ) -> PyResult<()> {
         use polars::io::avro::AvroWriter;
-        let mut buf = get_file_like(py_f, true)?;
+        let buf = FileWrapper::new(py_f, true)?;
         py.allow_threads(|| {
-            AvroWriter::new(&mut buf)
+            AvroWriter::new(buf)
                 .with_compression(compression.0)
                 .with_name(name)
                 .finish(&mut self.df)
