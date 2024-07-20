@@ -81,7 +81,7 @@ jobs:
           CFG: ${{ matrix.package == 'polars-lts-cpu' && '--cfg allocator="default"' || '' }}
         run: |
           echo "RUSTFLAGS=-C target-feature=$FEATURES -Z tune-cpu=$TUNE_CPU $CFG" >> $GITHUB_ENV
-          echo "CFLAGS=$CC_FEATURES -mtune=$TUNE_CPU" >> $GITHUB_ENV
+          echo "CFLAGS=$CC_FEATURES -mtune=$TUNE_CPU -O3" >> $GITHUB_ENV
 
       - name: Set variables in CPU check module
         run: |
@@ -92,17 +92,40 @@ jobs:
         run: |
           sed $SED_INPLACE 's/^_LTS_CPU = False$/_LTS_CPU = True/g' $CPU_CHECK_MODULE
 
-      - name: Set Rust target for aarch64
-        if: matrix.architecture == 'aarch64'
+      - name: Set Rust target
         id: target
+        env:
+          ARCH: ${{ matrix.architecture }}
         run: |
-          TARGET=${{ matrix.os == 'macos-13' && 'aarch64-apple-darwin' || 'aarch64-unknown-linux-gnu'}}
+          if [[ "$ARCH" = aarch64 ]]; then
+            TARGET=${{ matrix.os == 'macos-13' && 'aarch64-apple-darwin' || 'aarch64-unknown-linux-gnu'}}
+          else
+            TARGET=${{ matrix.os == 'macos-13' && 'x86_64-apple-darwin' || 'x86_64-unknown-linux-gnu'}}
+          fi
           echo "target=$TARGET" >> $GITHUB_OUTPUT
 
       - name: Set jemalloc for aarch64 Linux
         if: matrix.architecture == 'aarch64' && matrix.os == 'ubuntu-latest'
         run: |
           echo "JEMALLOC_SYS_WITH_LG_PAGE=16" >> $GITHUB_ENV
+
+      - name: Install maturin and zig
+        run: |
+          pip install maturin
+          # zig 0.13 uses LLVM 18, which matches the one used by Rust nightly-2024-06-23
+          pip install 'ziglang==0.13.*'
+        if: matrix.os == 'ubuntu-latest'
+
+      - name: Build wheel
+        run: |
+          maturin build \
+            --release \
+            --manifest-path py-polars/Cargo.toml \
+            --out dist \
+            --compatibility manylinux${{ matrix.architecture == 'aarch64' && '_2_24' || '2014' }} \
+            --target ${{ steps.target.outputs.target }} \
+            --zig
+        if: matrix.os == 'ubuntu-latest'
 
       - name: Build wheel
         uses: PyO3/maturin-action@v1
@@ -114,6 +137,7 @@ jobs:
             --manifest-path py-polars/Cargo.toml
             --out dist
           manylinux: ${{ matrix.architecture == 'aarch64' && '2_24' || 'auto' }}
+        if: matrix.os != 'ubuntu-latest'
 
       - name: Test wheel
         # Only test on x86-64 for now as this matches the runner architecture
